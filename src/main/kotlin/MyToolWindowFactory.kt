@@ -181,6 +181,11 @@ class MyToolWindowFactory : ToolWindowFactory {
                 if (disposedFlag.value) return
                 if (frame?.isMain != true) return
                 thisLogger().info("[deepseek] onLoadEnd url=${b?.url} status=$httpStatusCode")
+                // Сбрасываем флаг инъекции, чтобы observer инжектился заново
+                // после SPA-перезагрузки страницы.
+                try {
+                    b?.executeJavaScript("window.__deepseekAgentInjected = false;", b.url, 0)
+                } catch (_: Exception) {}
                 val script = buildObserverScript(injectBody)
                 thisLogger().info("[deepseek] injecting observer, len=${script.length}")
                 try {
