@@ -1,0 +1,87 @@
+<!-- Reference: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <id>ru.ichuk.deepseek</id>
+    <name>DeepSeek Agent</name>
+    <vendor>ichuk</vendor>
+
+    <description><![CDATA[
+        <h3>DeepSeek Agent — chat with your project</h3>
+        <p>
+        Embeds <a href="https://chat.deepseek.com">chat.deepseek.com</a> into a tool window
+        and bridges it with the IDE. The model can request file reads, targeted edits,
+        writes, directory listings, text searches, and shell commands — the plugin
+        executes them inside the current project and feeds the results back into the chat.
+        </p>
+
+        <h3>Tools the model can call</h3>
+        <ul>
+          <li><code>read_file("path")</code> — read a file</li>
+          <li><code>edit_file("path", "old", "new"[, "all"])</code> — targeted in-place replacement</li>
+          <li><code>write_file("path", "content")</code> — full rewrite (capped at 500 KB)</li>
+          <li><code>list_files("path")</code> — list a directory</li>
+          <li><code>search_text("needle")</code> — grep across the project</li>
+          <li><code>bash("command")</code> — run a shell command in the project root</li>
+        </ul>
+
+        <h3>Key features</h3>
+        <ul>
+          <li>Batch tool calls — multiple tools per turn, all results in one block</li>
+          <li>Plan mode: prefix with <code>plan:</code> to get a plan before execution</li>
+          <li>Auto-throttling, iteration cap, and automatic recovery from rate limits</li>
+          <li>Placeholder filtering on both JS and Kotlin sides</li>
+          <li>System preamble injected into the first message of every new chat</li>
+        </ul>
+
+        <h3>Requirements</h3>
+        <ul>
+          <li>IntelliJ IDEA 2025.3 (build 253) or newer</li>
+          <li>Web Browser (JCEF) plugin enabled</li>
+          <li>On Linux/Wayland: add <code>-Dawt.toolkit.name=XToolkit</code> to custom VM options for clipboard support</li>
+        </ul>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <h3>1.1.2</h3>
+        <ul>
+          <li>Automatic retry of lost [TOOL_RESULT] after a rate limit</li>
+          <li>30-second cooldown with auto-resume instead of a hard stop</li>
+          <li>Extended rate-limit detection patterns</li>
+          <li>White DeepSeek icon on the tool window sidebar</li>
+          <li>Extended plugin page description</li>
+          <li>Full English README</li>
+        </ul>
+
+        <h3>1.1.1</h3>
+        <ul>
+          <li>Placeholder path filter in ToolRunner</li>
+          <li>Whitelist for known tools in parseToolCalls</li>
+        </ul>
+
+        <h3>1.1.0</h3>
+        <ul>
+          <li>edit_file tool for targeted in-place replacements</li>
+          <li>Multiple tool calls per turn (batching)</li>
+          <li>System preamble injected into the first message of new chats</li>
+          <li>Auto-loop safeguards: throttling, iteration cap, rate-limit detection</li>
+        </ul>
+
+        <h3>1.0.0</h3>
+        <ul>
+          <li>Initial release: read_file, write_file, list_files, bash, search_text</li>
+          <li>JCEF-based DeepSeek chat in a tool window</li>
+          <li>JS ↔ Kotlin bridge via JBCefJSQuery</li>
+        </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.jcef</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+                id="DeepSeek Agent"
+                anchor="right"
+                canCloseContents="false"
+                factoryClass="ru.ichuk.deepseek.MyToolWindowFactory"
+                icon="/META-INF/icon.svg"/>
+    </extensions>
+</idea-plugin>
