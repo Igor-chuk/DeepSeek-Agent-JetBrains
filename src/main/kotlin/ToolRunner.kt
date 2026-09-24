@@ -122,10 +122,36 @@ class ToolRunner(private val project: Project) {
         val f = resolvePath(path)
         if (!f.exists()) return "File not found: $path"
         if (!f.isFile) return "Not a file: $path"
+
         val text = f.readText()
-        return if (text.length > 20_000) {
-            text.take(20_000) + "\n... [truncated, ${text.length} total chars]"
-        } else text
+        val rangeArg = args.getOrNull(1)
+
+        // Диапазон строк: read_file("path", "120-180")
+        if (!rangeArg.isNullOrBlank()) {
+            val m = Regex("""^\s*(\d+)\s*-\s*(\d+)\s*$""").find(rangeArg)
+            if (m != null) {
+                val start = m.groupValues[1].toInt().coerceAtLeast(1)
+                val end = m.groupValues[2].toInt().coerceAtLeast(start)
+                val lines = text.split('\n')
+                val from = (start - 1).coerceAtMost(lines.size)
+                val to = end.coerceAtMost(lines.size)
+                return "read_file: $path lines $start-$end (total ${lines.size} lines):\n" +
+                    lines.subList(from, to).joinToString("\n")
+            }
+        }
+
+        if (text.length > 20_000) {
+            val totalLines = text.count { it == '\n' } + 1
+            return buildString {
+                append("read_file: $path is ${text.length} chars, $totalLines lines. ")
+                append("Showing first 20 000. ")
+                append("To read more, use read_file(\"$path\", \"startLine-endLine\").\n")
+                append("--- beginning ---\n")
+                append(text.take(20_000))
+                append("\n... [truncated]")
+            }
+        }
+        return text
     }
 
     /**
@@ -135,11 +161,12 @@ class ToolRunner(private val project: Project) {
     private fun writeFile(args: List<String>): String {
         if (args.size < 2) {
             val got = args.joinToString(", ") { "\"" + it.take(40) + "\"" }
-            return "write_file: expected (path, content) but got ${args.size} arg(s): [$got]. " +
-                "Make sure both arguments are wrapped in double quotes and separated by a comma."
+            return "write_file: expected (path, content[, \"append\"]) but got ${args.size} arg(s): [$got]. " +
+                "Wrap every argument in double quotes and separate with commas."
         }
         val path = args[0]
         val content = args[1]
+        val mode = args.getOrNull(2)?.lowercase() ?: "overwrite"
         if (looksLikePlaceholder(path)) return "write_file: path \"" + path + "\" looks like a placeholder. Use a concrete path."
 
         if (content.length > MAX_WRITE_CHARS) {
@@ -148,16 +175,27 @@ class ToolRunner(private val project: Project) {
                 append("limit is $MAX_WRITE_CHARS. ")
                 append("Do NOT rewrite whole files. To modify an existing file, ")
                 append("use edit_file(path, old_string, new_string) with a small ")
-                append("unique fragment. For brand-new files keep them small. ")
-                append("If the file is large, inspect it with read_file / search_text, ")
-                append("then patch it with edit_file.")
+                append("unique fragment. For large NEW files, split into chunks: ")
+                append("write_file(path, chunk1) then write_file(path, chunk2, \"append\") etc. ")
+                append("Or use edit_file for targeted changes.")
             }
         }
 
         val f = resolvePath(path)
         f.parentFile?.mkdirs()
-        f.writeText(content)
-        return "Wrote ${content.length} chars to $path"
+        when (mode) {
+            "append" -> {
+                // Если файл не пустой и не заканчивается на \n — добавляем \n перед новым контентом,
+                // чтобы чанки не слипались в одну строку.
+                if (f.exists() && f.length() > 0L) {
+                    val tail = f.readText().takeLast(1)
+                    if (tail != "\n") f.appendText("\n")
+                }
+                f.appendText(content)
+            }
+            else -> f.writeText(content)
+        }
+        return "Wrote ${content.length} chars to $path (mode=$mode)"
     }
 
     /**
@@ -233,6 +271,33 @@ class ToolRunner(private val project: Project) {
 
     private fun runBash(args: List<String>): String {
         val cmd = args.getOrNull(0) ?: return "bash: missing command"
+
+        // Жёсткий стоп-лист на опасные команды. Это не полная защита —
+        // обойти можно (base64, скрипты, aliases). Но от лобовых rm -rf /
+        // и подобных уберегает.
+        val dangerous = listOf(
+            Regex("""\brm\s+(-\w+\s+)*rf\s+/(\s|$|\*)"""),           // rm -rf / и rm -rf /*
+            Regex("""\brm\s+(-\w+\s+)*rf\s+~"""),                     // rm -rf ~
+            Regex("""\brm\s+(-\w+\s+)*rf\s+\${'$'}HOME"""),           // rm -rf $HOME
+            Regex("""\bmkfs(\.[a-z0-9]+)?\b"""),                       // mkfs, mkfs.ext4
+            Regex("""\bdd\b.*\bof=/dev/"""),                           // dd of=/dev/sda
+            Regex(""">\s*/dev/sd[a-z]"""),                              // > /dev/sda
+            Regex(""":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?\s*:"""),    // fork bomb
+            Regex("""\bchmod\s+-R\s+000\s+/(\s|$)"""),                  // chmod -R 000 /
+            Regex("""\bchown\s+-R\s+.*\s+/(\s|$)"""),                   // chown -R /
+            Regex("""\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b"""),
+            Regex("""\bkill\s+-9\s+-1\b"""),
+            Regex("""\bcrontab\s+-r\b"""),
+            Regex("""\bmv\s+.*\s+/dev/null\b"""),                      // отправить файлы в никуда
+        )
+        for (rx in dangerous) {
+            if (rx.containsMatchIn(cmd)) {
+                thisLogger().warn("[tool] bash BLOCKED dangerous command: $cmd")
+                return "bash: REFUSED — command matches a dangerous pattern. " +
+                        "Если это действительно нужно — попроси пользователя выполнить это вручную."
+            }
+        }
+
         val pb = ProcessBuilder("bash", "-c", cmd)
         pb.directory(project.basePath?.let { File(it) })
         pb.redirectErrorStream(true)
@@ -264,7 +329,7 @@ class ToolRunner(private val project: Project) {
 
     companion object {
         /** Hard cap on a single write_file call. Beyond this we suggest edit_file. */
-        private const val MAX_WRITE_CHARS = 500_000
+        private const val MAX_WRITE_CHARS = 5_000_000
 
         /** Only these tool names are actually executed. */
         private val KNOWN_TOOLS = setOf(

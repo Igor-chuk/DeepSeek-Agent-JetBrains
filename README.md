@@ -12,9 +12,9 @@ The model stays where it is. The IDE does the work.
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `read_file` | `read_file("path")` | Reads a file (up to 20 000 chars). |
+| `read_file` | `read_file("path"[, "startLine-endLine"])` | Reads a file. For files over 20 000 chars, returns the beginning plus a hint to use the range form. |
 | `edit_file` | `edit_file("path", "old", "new"[, "all"])` | Targeted in-place replacement. Refuses on empty / ambiguous / missing `old` string. |
-| `write_file` | `write_file("path", "content")` | Full rewrite. Capped at 500 KB — larger writes are refused and redirected to `edit_file`. |
+| `write_file` | `write_file("path", "content"[, "append"])` | Write a file. Without 3rd arg — full rewrite (up to 5 MB). With `"append"` — appends to the end, auto-inserting `\n` if the file didn't end with one. |
 | `list_files` | `list_files("path")` | Lists a directory. |
 | `search_text` | `search_text("needle")` | Grep-like search across the project. Skips `.git`, `node_modules`, `build`, `.next`. |
 | `bash` | `bash("command")` | Runs a shell command in the project root. |

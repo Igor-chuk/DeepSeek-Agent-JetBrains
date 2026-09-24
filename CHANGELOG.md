@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-09-24
+
+### Added
+- `read_file(path, "startLine-endLine")` — read a specific range of lines. For large files, `read_file(path)` now returns the beginning plus a hint to use the range form.
+- `write_file(path, content, "append")` — append to a file. Automatically inserts `\n` between old and new content if the file didn't end with a newline, so chunks don't merge into one line.
+- Pre-amble: `АСИНХРОННЫЕ РЕЗУЛЬТАТЫ` block, updated `read_file` / `write_file` descriptions with range and append forms, and a note that `append` adds `\n` automatically.
+- `isMessageFinalized` now also checks DOM quiescence: if a message hasn't mutated in 2.5 seconds, it is considered finalized even when the bottom toolbar isn't rendered yet.
+
+### Changed
+- `MAX_WRITE_CHARS` raised from 500 KB to 5 MB.
+
 ## [1.2.1] — 2026-09-24
 
 ### Fixed
