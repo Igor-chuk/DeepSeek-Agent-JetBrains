@@ -19,7 +19,13 @@ The model stays where it is. The IDE does the work.
 | `search_text` | `search_text("needle")` | Grep-like search across the project. Skips `.git`, `node_modules`, `build`, `.next`. |
 | `bash` | `bash("command")` | Runs a shell command in the project root. |
 
-Batch calls are supported — several tools per assistant turn, all results returned in one block.
+Batch calls are supported — several tools per assistant turn.
+
+### Asynchronous tool results
+
+Each result is delivered to the chat **as soon as the corresponding tool finishes** — not as one batch at the end. A fast `read_file` returns immediately while a slow `npm install` keeps running in the background; the model sees the fast result first and can start reasoning about it before the slow one arrives.
+
+Results arrive in **completion order**, not call order. Between two consecutive results there is a 1.5 s gap so that DeepSeek accepts each message separately.
 
 ### Plan mode
 

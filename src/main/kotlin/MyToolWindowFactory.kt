@@ -64,28 +64,65 @@ class MyToolWindowFactory : ToolWindowFactory {
                         if (calls.isEmpty()) {
                             thisLogger().info("[tool] no known tool calls — ignoring")
                         } else {
-                            val sb = StringBuilder()
-                            for (call in calls) {
-                                val result = runOnEdt { toolRunner.execute(call) }
-                                sb.append("[TOOL_RESULT: ").append(call.name).append("]\n")
-                                sb.append(result)
-                                sb.append("\n")
+                            val pool = com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService()
+                            thisLogger().info("[tool] launching ${calls.size} call(s) in parallel")
+                            val futures = calls.map { call ->
+                                java.util.concurrent.CompletableFuture.supplyAsync(
+                                    java.util.function.Supplier {
+                                        try {
+                                            thisLogger().info("[tool] (parallel) executing ${call.name}")
+                                            val r = toolRunner.execute(call)
+                                            thisLogger().info("[tool] (parallel) done ${call.name}, len=${r.length}")
+                                            r
+                                        } catch (e: Exception) {
+                                            thisLogger().warn("[tool] (parallel) failed ${call.name}: ${e.message}", e)
+                                            "Error executing ${call.name}: ${e.message}"
+                                        }
+                                    },
+                                    pool
+                                )
                             }
-                            val resultText = sb.toString().trim()
-                            if (resultText.isNotEmpty()) {
-                                thisLogger().info("[tool] sending result back, len=${resultText.length}")
-                                val escaped = escapeForJsString(resultText)
-                                val js = "window.__insertToolResult && window.__insertToolResult('$escaped');"
-                                ApplicationManager.getApplication().invokeLater {
-                                    if (disposedFlag.value || browser.isDisposed) {
-                                        thisLogger().info("[deepseek] skipping executeJavaScript — browser disposed")
-                                        return@invokeLater
+                            // Отправляем результат КАЖДОГО вызова сразу по мере
+                            // завершения, а не ждём весь batch. Для быстрых команд
+                            // это значит, что модель получает результат раньше
+                            // и может продолжать работу, пока остальные ещё бегут.
+                            // Между сообщениями держим паузу 1.5 сек, чтобы
+                            // DeepSeek успевал принять каждое отдельно.
+                            val sendQueue = java.util.concurrent.LinkedBlockingQueue<Pair<String, String>>()
+                            val senderPool = java.util.concurrent.Executors.newSingleThreadExecutor()
+                            senderPool.execute {
+                                var lastSendAt = 0L
+                                while (true) {
+                                    val (name, result) = try {
+                                        sendQueue.take()
+                                    } catch (ie: InterruptedException) { return@execute }
+                                    if (disposedFlag.value || browser.isDisposed) continue
+                                    val now = System.currentTimeMillis()
+                                    val wait = 1500L - (now - lastSendAt)
+                                    if (lastSendAt > 0 && wait > 0) {
+                                        try { Thread.sleep(wait) } catch (ie: InterruptedException) {}
                                     }
-                                    try {
-                                        browser.cefBrowser.executeJavaScript(js, browser.cefBrowser.url, 0)
-                                    } catch (e: Exception) {
-                                        thisLogger().warn("[deepseek] executeJavaScript failed: ${e.message}")
+                                    val resultText = "[TOOL_RESULT: " + name + "]\n" + result
+                                    thisLogger().info("[tool] sending single result for ${name}, len=${resultText.length}")
+                                    val escaped = escapeForJsString(resultText)
+                                    val js = "window.__insertToolResult && window.__insertToolResult('$escaped');"
+                                    ApplicationManager.getApplication().invokeLater {
+                                        if (disposedFlag.value || browser.isDisposed) return@invokeLater
+                                        try {
+                                            browser.cefBrowser.executeJavaScript(js, browser.cefBrowser.url, 0)
+                                        } catch (e: Exception) {
+                                            thisLogger().warn("[deepseek] executeJavaScript failed: ${e.message}")
+                                        }
                                     }
+                                    lastSendAt = System.currentTimeMillis()
+                                }
+                            }
+                            for ((idx, call) in calls.withIndex()) {
+                                val idxFinal = idx
+                                futures[idx].whenComplete { result, err ->
+                                    val out = if (err != null) "Error: ${err.message}" else (result ?: "<no result>")
+                                    sendQueue.offer(call.name to out)
+                                    thisLogger().info("[tool] (async) queued result for ${call.name} (idx=$idxFinal)")
                                 }
                             }
                         }
@@ -475,7 +512,7 @@ class MyToolWindowFactory : ToolWindowFactory {
                             setTimeout(function() { isAutoSending = false; }, 300);
                             setTimeout(function() {
                                 if (!autoLoopStopped) pendingResultText = null;
-                            }, 2000);
+                            }, 12000);
                         }, 200);
                     }, 200);
                 } catch (e) {
@@ -490,6 +527,8 @@ class MyToolWindowFactory : ToolWindowFactory {
             var debounceTimers = new Map();
             var lastUrl = location.href;
             var lastMessageCount = -1;
+            var lastFirstKey = null;
+            var lastFirstKey = null;
 
             var TOOL_RE = /\[TOOL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([\s\S]*?)\)\s*]/;
 
@@ -564,13 +603,21 @@ class MyToolWindowFactory : ToolWindowFactory {
 
             function extractToolCallsText(contentEl) {
                 // 1. Code-блоки — их textContent сохраняет Markdown.
+                //    ВАЖНО: собираем ВСЕ блоки, а не только первый — модель
+                //    может выдать несколько ```tool ... ``` подряд, и каждый
+                //    нужно обработать.
                 var preBlocks = contentEl.querySelectorAll('pre, code');
+                var chunks = [];
                 for (var i = 0; i < preBlocks.length; i++) {
                     var t = preBlocks[i].textContent || '';
                     if (TOOL_RE.test(t)) {
-                        console.log('[deepseek-agent] candidate in <pre>/<code> (len=' + t.length + ')');
-                        return t;
+                        chunks.push(t);
                     }
+                }
+                if (chunks.length > 0) {
+                    var combined = chunks.join('\n');
+                    console.log('[deepseek-agent] collected ' + chunks.length + ' pre-block(s), total len=' + combined.length);
+                    return combined;
                 }
                 // 2. Fallback — innerText всего сообщения.
                 var raw = contentEl.innerText || '';
@@ -592,10 +639,38 @@ class MyToolWindowFactory : ToolWindowFactory {
                 return false;
             }
 
+            function isMessageFinalized(itemEl) {
+                // DeepSeek рендерит НИЖНИЙ тулбар сообщения (Copy / Regenerate /
+                // Like / Dislike / Read aloud / Share) только когда стрим
+                // закончился. Отличить его от внутреннего тулбара кодового
+                // блока (Copy / Download) можно по количеству кнопок:
+                // у нижнего — минимум 5-6, у кодового — 2.
+                var bars = itemEl.querySelectorAll('div.ds-flex[style*="gap: 10px"]');
+                for (var b = 0; b < bars.length; b++) {
+                    var btns = bars[b].querySelectorAll('div[role="button"], button');
+                    if (btns.length >= 5) return true;
+                }
+                // Fallback: кнопка "Читать вслух" / "Read aloud" есть только
+                // у финализированного нижнего тулбара.
+                var all = itemEl.querySelectorAll('[aria-label]');
+                for (var i = 0; i < all.length; i++) {
+                    var lbl = (all[i].getAttribute('aria-label') || '').toLowerCase();
+                    if (lbl === 'читать вслух' || lbl === 'read aloud') return true;
+                }
+                return false;
+            }
+
             function tryProcess(itemEl) {
                 var key = itemEl.getAttribute('data-virtual-list-item-key') || '';
                 if (!key) return;
                 if (processedKeys.has(key)) return;
+
+                if (!isMessageFinalized(itemEl)) {
+                    // Сообщение ещё в стриме — обработаем позже.
+                    // ВАЖНО: перепланируем проверку, а не выходим навсегда.
+                    scheduleCheck(itemEl);
+                    return;
+                }
 
                 var contentEl = itemEl.querySelector('.ds-assistant-message-main-content');
                 if (!contentEl) return;
@@ -647,7 +722,7 @@ class MyToolWindowFactory : ToolWindowFactory {
                 var t = setTimeout(function() {
                     debounceTimers.delete(key);
                     tryProcess(itemEl);
-                }, 600);
+                }, 2000);
                 debounceTimers.set(key, t);
             }
 
@@ -689,6 +764,18 @@ class MyToolWindowFactory : ToolWindowFactory {
             }
 
             function detectRateLimit() {
+                var items = document.querySelectorAll('[data-virtual-list-item-key]');
+                var lastN = Math.min(items.length, 2);
+                for (var k = items.length - lastN; k < items.length; k++) {
+                    var it = items[k];
+                    if (!it) continue;
+                    var txt = it.innerText || '';
+                    for (var m = 0; m < RATE_LIMIT_PATTERNS.length; m++) {
+                        if (txt.indexOf(RATE_LIMIT_PATTERNS[m]) !== -1) {
+                            return RATE_LIMIT_PATTERNS[m];
+                        }
+                    }
+                }
                 var probes = document.querySelectorAll(
                     '[role="alert"], [class*="toast"], [class*="Toast"], [class*="notification"], [class*="Notification"], .ds-toast, .ds-notification'
                 );
@@ -706,10 +793,18 @@ class MyToolWindowFactory : ToolWindowFactory {
             function watchdog() {
                 try {
                     var urlChanged = (location.href !== lastUrl);
-                    var currentCount = document.querySelectorAll('[data-virtual-list-item-key]').length;
+                    var items = document.querySelectorAll('[data-virtual-list-item-key]');
+                    var currentCount = items.length;
+                    var firstKey = items.length > 0 ? (items[0].getAttribute('data-virtual-list-item-key') || '') : '';
+                    var chatChanged = (lastFirstKey !== null) && (firstKey !== lastFirstKey) && (firstKey !== '');
+                    lastFirstKey = firstKey;
                     var reset = (currentCount < lastMessageCount);
 
-                    if (urlChanged || reset) {
+                    if (chatChanged) {
+                        console.log('[deepseek-agent] chat changed (first key ' + firstKey + '), re-baselining');
+                    }
+
+                    if (urlChanged || reset || chatChanged) {
                         if (urlChanged) {
                             console.log('[deepseek-agent] URL changed: ' + lastUrl + ' -> ' + location.href);
                             lastUrl = location.href;
@@ -721,6 +816,9 @@ class MyToolWindowFactory : ToolWindowFactory {
 
                     if (!autoLoopStopped) {
                         var rl = detectRateLimit();
+                        if (isAutoSending) {
+                            console.log('[deepseek-agent] watchdog: isAutoSending=true, rate-limit=' + (rl || 'none'));
+                        }
                         if (rl) {
                             if (!autoLoopStopped) {
                                 autoLoopStopped = true;

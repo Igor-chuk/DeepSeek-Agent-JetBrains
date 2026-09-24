@@ -133,7 +133,11 @@ class ToolRunner(private val project: Project) {
      * For edits to existing files, prefer [editFile].
      */
     private fun writeFile(args: List<String>): String {
-        if (args.size < 2) return "write_file: expected (path, content)"
+        if (args.size < 2) {
+            val got = args.joinToString(", ") { "\"" + it.take(40) + "\"" }
+            return "write_file: expected (path, content) but got ${args.size} arg(s): [$got]. " +
+                "Make sure both arguments are wrapped in double quotes and separated by a comma."
+        }
         val path = args[0]
         val content = args[1]
         if (looksLikePlaceholder(path)) return "write_file: path \"" + path + "\" looks like a placeholder. Use a concrete path."
@@ -165,7 +169,9 @@ class ToolRunner(private val project: Project) {
      */
     private fun editFile(args: List<String>): String {
         if (args.size < 3) {
-            return "edit_file: expected (path, old_string, new_string[, \"all\"])"
+            val got = args.joinToString(", ") { "\"" + it.take(40) + "\"" }
+            return "edit_file: expected (path, old_string, new_string[, \"all\"]) but got ${args.size} arg(s): [$got]. " +
+                "Wrap every argument in double quotes and separate with commas."
         }
         val path = args[0]
         val oldStr = args[1]
