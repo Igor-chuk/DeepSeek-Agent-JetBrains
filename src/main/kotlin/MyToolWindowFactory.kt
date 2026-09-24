@@ -3,6 +3,7 @@ package ru.ichuk.deepseek
 import com.google.gson.JsonParser
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.ToolWindow
@@ -11,24 +12,25 @@ import com.intellij.ui.content.ContentFactory
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
-import com.intellij.ui.jcef.JBCefBrowserBuilder
 import com.intellij.ui.jcef.JBCefJSQuery
+import com.intellij.util.concurrency.AppExecutorUtil
 import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
 import org.cef.handler.CefLoadHandlerAdapter
+import java.nio.charset.StandardCharsets
+import java.util.Base64
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import javax.swing.JLabel
 import javax.swing.SwingConstants
 import javax.swing.UIManager
 
-class MyToolWindowFactory : ToolWindowFactory {
+class MyToolWindowFactory : ToolWindowFactory, DumbAware {
 
     override fun shouldBeAvailable(project: Project) = true
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
-        thisLogger().info("[deepseek] createToolWindowContent called")
-
         if (!JBCefApp.isSupported()) {
-            thisLogger().warn("[deepseek] JCEF is NOT supported")
             val label = JLabel("JCEF is not available in this IDE build.", SwingConstants.CENTER)
             label.foreground = UIManager.getColor("Label.disabledForeground")
             toolWindow.contentManager.addContent(
@@ -37,129 +39,24 @@ class MyToolWindowFactory : ToolWindowFactory {
             return
         }
 
-        val disposedFlag = DisposeFlag()
-        val browser = JBCefBrowser.createBuilder()
-            .setOffScreenRendering(false)
-            .build()
-        thisLogger().info("[deepseek] browser created (empty, OSR=off)")
-
+        val disposed = DisposeFlag()
+        val browser = JBCefBrowser.createBuilder().setOffScreenRendering(false).build()
         val toolRunner = ToolRunner(project)
-
-        // ---- JS -> Kotlin bridge ------------------------------------------
         val jsQuery = JBCefJSQuery.create(browser as JBCefBrowserBase)
+        val pool = AppExecutorUtil.getAppExecutorService()
 
         jsQuery.addHandler { payload ->
-            if (disposedFlag.value) return@addHandler JBCefJSQuery.Response("disposed")
-            thisLogger().info("[bridge] from JS: $payload")
+            if (disposed.value) return@addHandler JBCefJSQuery.Response("disposed")
             try {
                 val json = JsonParser.parseString(payload).asJsonObject
-                val action = json.get("action")?.asString
-
-                when (action) {
+                when (json.get("action")?.asString) {
                     "tool_calls" -> {
-                        val text = json.get("text")?.asString ?: ""
-                        val calls = toolRunner.parseToolCalls(text)
-                        thisLogger().info("[tool] parsed ${calls.size} call(s)")
-
-                        if (calls.isEmpty()) {
-                            thisLogger().info("[tool] no known tool calls — ignoring")
-                        } else {
-                            val pool = com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService()
-                            thisLogger().info("[tool] launching ${calls.size} call(s)")
-
-                            // Очередь на отправку. Каждый элемент — одно [TOOL_RESULT]-сообщение.
-                            val sendQueue = java.util.concurrent.LinkedBlockingQueue<Pair<String, String>>()
-
-                            // Единый поток-отправитель: умеет "ждать окончания стрима модели"
-                            // и встраиваться после него, а не обрывать текущий ответ.
-                            val senderPool = java.util.concurrent.Executors.newSingleThreadExecutor()
-                            senderPool.execute {
-                                while (true) {
-                                    val pair = try { sendQueue.take() } catch (ie: InterruptedException) { return@execute }
-                                    if (disposedFlag.value || browser.isDisposed) continue
-                                    val (name, result) = pair
-
-                                    // Умное встраивание: ждём, пока модель закончит текущий ответ.
-                                    // Признак: по последнему assistant-сообщению 1.5 сек не было мутаций.
-                                    val waitStart = System.currentTimeMillis()
-                                    while (!disposedFlag.value && !browser.isDisposed && isModelWriting()) {
-                                        if (System.currentTimeMillis() - waitStart > 60_000L) break
-                                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
-                                    }
-                                    if (disposedFlag.value || browser.isDisposed) continue
-
-                                    val resultText = "[TOOL_RESULT: " + name + "]\n" + result
-                                    thisLogger().info("[tool] sending result for $name, len=${resultText.length}")
-                                    val escaped = escapeForJsString(resultText)
-                                    val js = "window.__insertToolResult && window.__insertToolResult('$escaped');"
-                                    ApplicationManager.getApplication().invokeLater {
-                                        if (disposedFlag.value || browser.isDisposed) return@invokeLater
-                                        try {
-                                            browser.cefBrowser.executeJavaScript(js, browser.cefBrowser.url, 0)
-                                        } catch (e: Exception) {
-                                            thisLogger().warn("[deepseek] executeJavaScript failed: ${e.message}")
-                                        }
-                                    }
-                                    // Небольшая пауза между сообщениями, чтобы DeepSeek успел принять.
-                                    try { Thread.sleep(1500) } catch (_: InterruptedException) {}
-                                }
-                            }
-
-                            // --- Bash: параллельно, каждый результат сразу в очередь ---
-                            val bashFutures = mutableListOf<java.util.concurrent.CompletableFuture<Unit>>()
-                            for ((i, call) in calls.withIndex()) {
-                                if (call.name == "bash") {
-                                    val idx = i
-                                    val f = java.util.concurrent.CompletableFuture.supplyAsync(
-                                        java.util.function.Supplier {
-                                            try {
-                                                thisLogger().info("[tool] (bash-parallel) ${call.name}")
-                                                val r = toolRunner.execute(call)
-                                                thisLogger().info("[tool] (bash-parallel) done ${call.name}, len=${r.length}")
-                                                sendQueue.offer(call.name to r)
-                                            } catch (e: Exception) {
-                                                sendQueue.offer(call.name to "Error: ${e.message}")
-                                            }
-                                            Unit
-                                        },
-                                        pool
-                                    )
-                                    bashFutures.add(f)
-                                }
-                            }
-
-                            // --- Файловые: последовательно, одним пакетом в конце ---
-                            pool.execute {
-                                val sb = StringBuilder()
-                                var anyResult = false
-                                for ((i, call) in calls.withIndex()) {
-                                    if (call.name == "bash") continue
-                                    try {
-                                        thisLogger().info("[tool] (sequential) ${call.name}")
-                                        val r = toolRunner.execute(call)
-                                        sb.append("[TOOL_RESULT: ").append(call.name).append("]\n")
-                                        sb.append(r).append("\n\n")
-                                        anyResult = true
-                                    } catch (e: Exception) {
-                                        sb.append("[TOOL_RESULT: ").append(call.name).append("]\n")
-                                        sb.append("Error: ").append(e.message).append("\n\n")
-                                        anyResult = true
-                                    }
-                                }
-                                if (anyResult) {
-                                    // Пакет файловых одним сообщением.
-                                    // Отправляем через ту же очередь — sender вставит
-                                    // его в конец текущего ответа или сразу, если модель молчит.
-                                    sendQueue.offer("__file_batch__" to sb.toString().trim())
-                                }
-                                // Дожидаемся завершения всех bash, чтобы не завершить функцию раньше
-                                try {
-                                    java.util.concurrent.CompletableFuture.allOf(*bashFutures.toTypedArray()).join()
-                                } catch (_: Exception) {}
-                            }
-                        }
+                        val text = json.get("text")?.asString.orEmpty()
+                        val runId = json.get("runId")?.asString.orEmpty()
+                            .filter { it.isLetterOrDigit() }.take(32)
+                        pool.execute { runToolBatch(toolRunner, browser, disposed, pool, runId, text) }
                     }
-                    else -> thisLogger().info("[bridge] unknown action=$action")
+                    "log" -> thisLogger().info("[js] " + json.get("text")?.asString.orEmpty())
                 }
                 JBCefJSQuery.Response("ok")
             } catch (e: Exception) {
@@ -167,532 +64,688 @@ class MyToolWindowFactory : ToolWindowFactory {
                 JBCefJSQuery.Response("error: ${e.message}")
             }
         }
-        thisLogger().info("[deepseek] jsQuery handler attached")
 
         val injectBody = jsQuery.inject(
             "payload",
-            "response => { console.log('[to-kotlin-ok]', response); }",
-            "error => { console.error('[to-kotlin-err]', error); }",
+            "response => { /* ok */ }",
+            "error => { console.error('[to-kotlin-err]', error); }"
         )
 
-        // ---- Load handler -------------------------------------------------
         val loadHandler = object : CefLoadHandlerAdapter() {
             override fun onLoadEnd(b: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
-                if (disposedFlag.value) return
-                if (frame?.isMain != true) return
-                thisLogger().info("[deepseek] onLoadEnd url=${b?.url} status=$httpStatusCode")
-                // Сбрасываем флаг инъекции, чтобы observer инжектился заново
-                // после SPA-перезагрузки страницы.
+                if (disposed.value || frame?.isMain != true || b == null) return
                 try {
-                    b?.executeJavaScript("window.__deepseekAgentInjected = false;", b.url, 0)
-                } catch (_: Exception) {}
-                val script = buildObserverScript(injectBody)
-                thisLogger().info("[deepseek] injecting observer, len=${script.length}")
-                try {
-                    b?.executeJavaScript(script, b.url, 0)
+                    b.executeJavaScript(buildAgentScript(injectBody), b.url, 0)
                 } catch (e: Exception) {
-                    thisLogger().warn("[deepseek] executeJavaScript (observer) failed: ${e.message}")
+                    thisLogger().warn("[deepseek] injection failed: ${e.message}")
                 }
             }
         }
+
         browser.jbCefClient.addLoadHandler(loadHandler, browser.cefBrowser)
-        thisLogger().info("[deepseek] load handler attached")
-
         browser.loadURL("https://chat.deepseek.com")
-        thisLogger().info("[deepseek] loadURL called")
 
-        val content = ContentFactory.getInstance()
-            .createContent(browser.component, "DeepSeek", false)
-
+        val content = ContentFactory.getInstance().createContent(browser.component, "DeepSeek", false)
         content.setDisposer {
-            thisLogger().info("[deepseek] disposing browser + handlers")
-            disposedFlag.value = true
+            disposed.value = true
             try { browser.jbCefClient.removeLoadHandler(loadHandler, browser.cefBrowser) } catch (_: Exception) {}
             try { Disposer.dispose(jsQuery) } catch (_: Exception) {}
             try { Disposer.dispose(browser) } catch (_: Exception) {}
-            thisLogger().info("[deepseek] dispose complete")
+        }
+        toolWindow.contentManager.addContent(content)
+    }
+
+    // ---------- Выполнение пакета вызовов ----------
+
+    private fun runToolBatch(
+        toolRunner: ToolRunner,
+        browser: JBCefBrowser,
+        disposed: DisposeFlag,
+        pool: java.util.concurrent.ExecutorService,
+        runId: String,
+        text: String
+    ) {
+        if (disposed.value) return
+
+        val calls = try { toolRunner.parseToolCalls(text) } catch (e: Exception) {
+            thisLogger().warn("[tool] parse failed", e)
+            emptyList()
+        }
+        thisLogger().info("[tool] parsed ${calls.size} call(s), runId=$runId")
+
+        // Ответ отправляем ВСЕГДА, иначе JS остаётся в состоянии ожидания.
+        if (calls.isEmpty()) {
+            sendToBrowser(
+                browser, disposed, runId,
+                "[TOOL_ERROR]\nНе удалось разобрать ни одного вызова инструмента.\n" +
+                        "Проверь синтаксис: [TOOL: name(\"arg1\", \"arg2\")] внутри блока ```tool, " +
+                        "все кавычки и скобки должны быть закрыты."
+            )
+            return
         }
 
-        toolWindow.contentManager.addContent(content)
-        thisLogger().info("[deepseek] content added")
-    }
+        val results = arrayOfNulls<String>(calls.size)
 
-    /**
-     * Считаем, что модель сейчас пишет, если по последнему assistant-сообщению
-     * была мутация менее 1.5 сек назад. Пока это так — ждём, чтобы вставить
-     * [TOOL_RESULT] в конец ответа, а не разрезать его посередине.
-     *
-     * Внимание: логика параллельна JS-состоянию lastMutationAt.
-     * Мы не имеем прямого доступа к JS-карте из Kotlin, поэтому используем
-     * эвристику: спрашиваем состояние через executeJavaScript и ждём ответа
-     * асинхронно. Если ответ не пришёл — считаем, что модель молчит.
-     */
-    private fun isModelWriting(): Boolean {
-        // Упрощённая реализация: проверяем глобальный флаг, который выставляет JS.
-        // В observer.js добавлено: window.__deepseekAgentModelWriting = true/false
-        // на основе lastMutationAt последнего сообщения. Kotlin опрашивает его
-        // через флаг, который мы читаем из JBCefJSQuery? — проще не делать,
-        // а опираться на паузу. Здесь возвращаем false, чтобы не блокировать;
-        // реальная защита — в JS __insertToolResult, который сам ждёт
-        // окончания стрима перед вставкой.
-        return false
-    }
-
-    private fun escapeForJsString(s: String): String {
-        val sb = StringBuilder(s.length + 16)
-        for (c in s) {
-            when (c) {
-                '\\' -> sb.append("\\\\")
-                '\'' -> sb.append("\\'")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                '<'  -> sb.append("\\u003c")
-                '>'  -> sb.append("\\u003e")
-                '\u2028' -> sb.append("\\u2028")
-                '\u2029' -> sb.append("\\u2029")
-                else -> sb.append(c)
+        // bash — параллельно, файловые операции — последовательно, порядок вывода сохраняем.
+        val futures = HashMap<Int, CompletableFuture<String>>()
+        calls.forEachIndexed { i, call ->
+            if (call.name == "bash") {
+                futures[i] = CompletableFuture.supplyAsync({ toolRunner.execute(call) }, pool)
             }
         }
-        return sb.toString()
+        calls.forEachIndexed { i, call ->
+            if (call.name != "bash") {
+                results[i] = if (disposed.value) "[cancelled]" else toolRunner.execute(call)
+            }
+        }
+        futures.forEach { (i, f) ->
+            results[i] = try {
+                f.get(BATCH_TIMEOUT_SEC, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                f.cancel(true)
+                "Error: ${e.javaClass.simpleName}: ${e.message}"
+            }
+        }
+
+        val sb = StringBuilder()
+        calls.forEachIndexed { i, call ->
+            val hint = call.args.firstOrNull()?.take(60)?.replace("\n", " ") ?: ""
+            sb.append("[TOOL_RESULT: ").append(call.name)
+            if (hint.isNotEmpty()) sb.append(" — ").append(hint)
+            sb.append("]\n").append(results[i] ?: "(no result)").append("\n\n")
+        }
+
+        sendToBrowser(browser, disposed, runId, sb.toString().trim())
     }
 
-    private fun buildObserverScript(injectBody: String): String {
-        val escapedPreamble = escapeForJsString(SYSTEM_PREAMBLE)
+    private fun sendToBrowser(browser: JBCefBrowser, disposed: DisposeFlag, runId: String, result: String) {
+        val capped = if (result.length > MAX_RESULT_CHARS)
+            result.take(MAX_RESULT_CHARS) + "\n\n... [общий результат обрезан до $MAX_RESULT_CHARS символов]"
+        else result
+
+        // Base64 полностью снимает проблемы экранирования кавычек/переносов/юникода.
+        val b64 = Base64.getEncoder().encodeToString(capped.toByteArray(StandardCharsets.UTF_8))
+        val js = "window.__dsInsertToolResult && window.__dsInsertToolResult('$runId','$b64');"
+
+        ApplicationManager.getApplication().invokeLater {
+            if (disposed.value) return@invokeLater
+            try {
+                browser.cefBrowser.executeJavaScript(js, browser.cefBrowser.url, 0)
+            } catch (e: Exception) {
+                thisLogger().warn("[deepseek] executeJavaScript failed: ${e.message}")
+            }
+        }
+    }
+
+    // ---------- Инжектируемый скрипт ----------
+
+    private fun buildAgentScript(injectBody: String): String {
+        val enc = Base64.getEncoder()
+        val preambleB64 = enc.encodeToString(SYSTEM_PREAMBLE.toByteArray(StandardCharsets.UTF_8))
+        // Фразы rate-limit держим в base64: иначе чтение исходников самого плагина
+        // добавляет их в DOM чата, и детектор срабатывает на собственном коде.
+        val phrasesB64 = enc.encodeToString(
+            listOf(
+                "\u0421\u043B\u0438\u0448\u043A\u043E\u043C \u0447\u0430\u0441\u0442\u044B\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F",
+                "Too many requests",
+                "\u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u043F\u043E\u043F\u044B\u0442\u043A\u0443 \u043F\u043E\u0437\u0436\u0435"
+            ).joinToString("\u0001").toByteArray(StandardCharsets.UTF_8)
+        )
+
         return """
         (function() {
-            if (window.__deepseekAgentInjected) {
-                console.log('[deepseek-agent] already injected');
-                if (window.__deepseekAgentEnsure) {
-                    try { window.__deepseekAgentEnsure(); } catch (e) {}
-                }
-                return;
+            if (window.__dsAgentV4) { console.log('[ds-agent] already injected'); return; }
+            window.__dsAgentV4 = true;
+
+            function b64d(s) {
+                var bin = atob(s), bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                return new TextDecoder('utf-8').decode(bytes);
             }
-            window.__deepseekAgentInjected = true;
-            console.log('[deepseek-agent] injected');
 
-            var SYSTEM_PREAMBLE = '$escapedPreamble';
+            var SYSTEM_PREAMBLE = b64d('$preambleB64');
+            var RL_PHRASES = b64d('$phrasesB64').split('\u0001');
 
-            var KNOWN_TOOLS = ['read_file','write_file','edit_file','list_files','bash','search_text'];
-            var AUTO_MIN_INTERVAL_MS = 5000;
-            var AUTO_COOLDOWN_AFTER_RATELIMIT_MS = 30000;
-            var MAX_AUTO_ITERATIONS = 20;
-            var RATE_LIMIT_PATTERNS = [
-                'Слишком частые сообщения',
-                'Повторите попытку позже',
-                'Too frequent messages',
-                'Too many requests',
-                'rate limit',
-                'Rate limit',
-                'Слишком много запросов',
-                'Too many requests, please try again later',
-                'please try again later',
-                'Попробуйте позже',
-                'Server is busy',
-                'Server busy',
-            ];
+            var CFG = {
+                pollMs: 700,
+                stableMs: 1200,          // ответ считаем законченным, если текст не менялся
+                minSendInterval: 2500,
+                maxIterations: 60,
+                toolTimeoutMs: 180000,   // страховка, если Kotlin не ответил
+                generatingMaxMs: 300000, // страховка от залипшего индикатора генерации
+                sendAttempts: 8,
+                verifyMs: 3500,          // окно подтверждения доставки
+                rlWaitMs: 20000,         // пауза при rate limit
+                rlMaxWaits: 8,
+                rlBackoffMs: 7000,       // интервал между отправками после лимита
+                failWaitMs: 3000,        // не-лимитная ошибка отправки
+                retryCheckMs: 9000,      // сколько ждем результата клика по кнопке повтора
+                rlMaxLen: 160,           // длиннее — это текст чата, а не предупреждение
+                maxBlockChars: 4000,
+                maxSameCall: 3
+            };
 
-            var pendingResultText = null;
-            var lastAutoSendAt = 0;
-            var autoIterations = 0;
-            var autoLoopStopped = false;
-            var autoLoopStopReason = '';
-            var isAutoSending = false;
+            // state: idle | stream | tools | send | verify | cooldown
+            var S = {
+                state: 'idle', stateAt: Date.now(),
+                lastSendAt: 0, minInterval: CFG.minSendInterval,
+                iterations: 0, stopped: false,
+                generatingSince: 0,
+                processed: {}, snap: {}, handledErr: {},
+                lastCallText: '', sameCallCount: 0,
+                pendingText: null, rlHits: 0
+            };
 
-            window.__sendToKotlin = function(payload) {
+            function isBusy() {
+                return S.state === 'send' || S.state === 'verify' || S.state === 'cooldown';
+            }
+
+            window.__dsSendToKotlin = function(payload) {
                 $injectBody
             };
 
-            window.__deepseekAgentStop = function(reason) {
-                autoLoopStopped = true;
-                autoLoopStopReason = reason || 'manual';
-            };
-            window.__deepseekAgentResume = function() {
-                autoLoopStopped = false;
-                autoIterations = 0;
-                lastAutoSendAt = 0;
-                autoLoopStopReason = '';
-            };
-            window.__deepseekAgentStatus = function() {
-                return {
-                    autoIterations: autoIterations,
-                    stopped: autoLoopStopped,
-                    reason: autoLoopStopReason,
-                    sinceLastSendMs: Date.now() - lastAutoSendAt,
-                };
-            };
-            window.__deepseekAgentDump = function() {
-                var items = document.querySelectorAll('[data-virtual-list-item-key]');
-                var last = items[items.length - 1];
-                if (!last) { console.log('no messages'); return; }
-                var c = last.querySelector('.ds-assistant-message-main-content');
-                if (c) {
-                    console.log('--- innerText ---', c.innerText);
-                    console.log('--- pre blocks ---', c.querySelectorAll('pre').length);
-                }
-            };
+            // ---------------- статус ----------------
 
-            function findInputTextarea() {
+            var badge = null, statusText = '';
+
+            function setStatus(t) {
+                if (t === statusText) return;
+                statusText = t;
+                console.log('[ds-agent]', S.state, '|', t);
+                try {
+                    if (!badge || !badge.isConnected) {
+                        badge = document.createElement('div');
+                        badge.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;' +
+                            'font:11px/1.5 monospace;padding:3px 8px;border-radius:6px;max-width:60vw;' +
+                            'background:rgba(0,0,0,.65);color:#fff;pointer-events:none;opacity:.8';
+                        document.documentElement.appendChild(badge);
+                    }
+                    badge.textContent = 'agent: ' + t;
+                } catch (e) {}
+            }
+
+            function setState(s, msg) {
+                if (S.state !== s) { S.state = s; S.stateAt = Date.now(); }
+                if (msg) setStatus(msg);
+            }
+
+            function hashOf(s) {
+                var h = 5381;
+                for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+                return 'h' + (h >>> 0);
+            }
+
+            // ---------------- элементы страницы ----------------
+
+            function findInput() {
+                var el = document.getElementById('chat-input');
+                if (el) return el;
                 var all = document.querySelectorAll('textarea');
                 for (var i = 0; i < all.length; i++) {
-                    var ph = all[i].placeholder || '';
-                    if (ph.indexOf('DeepSeek') !== -1) return all[i];
-                }
-                for (var j = all.length - 1; j >= 0; j--) {
-                    if (!all[j].closest('[data-virtual-list-item-key]')) return all[j];
+                    var ph = (all[i].placeholder || '').toLowerCase();
+                    if (ph.indexOf('deepseek') !== -1 || ph.indexOf('сообщен') !== -1 || ph.indexOf('message') !== -1) return all[i];
                 }
                 if (all.length > 0) return all[all.length - 1];
-                var editables = document.querySelectorAll('div[contenteditable="true"]');
-                if (editables.length > 0) return editables[editables.length - 1];
+                return document.querySelector('div[contenteditable="true"]');
+            }
+
+            function readValue(el) {
+                return el ? ((el.tagName === 'TEXTAREA' ? el.value : el.innerText) || '') : '';
+            }
+
+            function setValue(el, v) {
+                if (!el) return;
+                if (el.tagName === 'TEXTAREA') {
+                    var d = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+                    if (d && d.set) d.set.call(el, v); else el.value = v;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                } else {
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('insertText', false, v);
+                }
+            }
+
+            function isVisible(el) {
+                if (!el || !el.isConnected) return false;
+                var r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }
+
+            function findSendButton(input) {
+                if (!input) return null;
+                var parent = input.parentElement, fallback = null;
+                for (var i = 0; i < 5 && parent; i++) {
+                    var btns = parent.querySelectorAll('div[role="button"], button');
+                    for (var j = btns.length - 1; j >= 0; j--) {
+                        var b = btns[j];
+                        if (b.contains(input)) continue;
+                        var lbl = (b.getAttribute('aria-label') || '').toLowerCase();
+                        if (lbl.indexOf('send') !== -1 || lbl.indexOf('отправ') !== -1) return b;
+                        if (!fallback && (b.querySelector('svg') || b.getAttribute('type') === 'submit')) fallback = b;
+                    }
+                    parent = parent.parentElement;
+                }
+                return fallback;
+            }
+
+            function pressEnter(el) {
+                var o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+                el.dispatchEvent(new KeyboardEvent('keydown', o));
+                el.dispatchEvent(new KeyboardEvent('keypress', o));
+                el.dispatchEvent(new KeyboardEvent('keyup', o));
+            }
+
+            function isGenerating() {
+                var gen = false;
+                try {
+                    if (document.querySelectorAll('[aria-label*="Stop" i],[aria-label*="Останов" i]').length > 0) gen = true;
+                } catch (e) {}
+                if (!gen) {
+                    var b = findSendButton(findInput());
+                    var l = b ? (b.getAttribute('aria-label') || '').toLowerCase() : '';
+                    if (l.indexOf('stop') !== -1 || l.indexOf('останов') !== -1) gen = true;
+                }
+                if (gen) {
+                    if (!S.generatingSince) S.generatingSince = Date.now();
+                    if (Date.now() - S.generatingSince > CFG.generatingMaxMs) return false;
+                    return true;
+                }
+                S.generatingSince = 0;
+                return false;
+            }
+
+            // ---------------- непринятое сообщение и кнопка повтора ----------------
+
+            function matchesRl(t) {
+                if (!t) return false;
+                var s = t.trim();
+                if (!s || s.length > CFG.rlMaxLen) return false;
+                for (var i = 0; i < RL_PHRASES.length; i++) {
+                    if (s.indexOf(RL_PHRASES[i]) !== -1) return true;
+                }
+                return false;
+            }
+
+            function scopeKey(scope) {
+                var k = scope.getAttribute && scope.getAttribute('data-virtual-list-item-key');
+                return 'e' + (k || hashOf((scope.textContent || '').slice(0, 120)));
+            }
+
+            // Оранжевая круглая кнопка повтора у непринятого сообщения:
+            // div[role=button].ds-button--warning.ds-button--filled.ds-button--circle
+            function findRetryIn(scope) {
+                var sel = '[role="button"][class*="ds-button--warning"], button[class*="ds-button--warning"]';
+                var found = scope.querySelectorAll(sel);
+                for (var i = 0; i < found.length; i++) {
+                    if (isVisible(found[i])) return found[i];
+                }
+                var up = scope.parentElement;
+                for (var h = 0; h < 2 && up; h++) {
+                    var f2 = up.querySelectorAll(sel);
+                    for (var j = 0; j < f2.length; j++) {
+                        if (isVisible(f2[j])) return f2[j];
+                    }
+                    up = up.parentElement;
+                }
                 return null;
             }
 
-            function setReactValue(ta, newVal) {
-                if (ta.tagName === 'TEXTAREA') {
-                    var proto = Object.getPrototypeOf(ta);
-                    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                    if (desc && desc.set) desc.set.call(ta, newVal); else ta.value = newVal;
-                    ta.dispatchEvent(new Event('input', { bubbles: true }));
-                    ta.dispatchEvent(new Event('change', { bubbles: true }));
-                } else {
-                    ta.focus();
-                    document.execCommand('selectAll', false, null);
-                    document.execCommand('insertText', false, newVal);
+            // Текст ошибки лежит в блоке, соседнем с пузырем .ds-message,
+            // поэтому осматриваем контейнер элемента списка целиком.
+            function findFailedSend() {
+                var scopes = [];
+                var items = document.querySelectorAll('[data-virtual-list-item-key]');
+                for (var i = items.length - 1; i >= Math.max(0, items.length - 2); i--) scopes.push(items[i]);
+                if (!scopes.length) {
+                    var msgs = document.querySelectorAll('.ds-message');
+                    if (msgs.length && msgs[msgs.length - 1].parentElement) scopes.push(msgs[msgs.length - 1].parentElement);
                 }
+                var toasts = document.querySelectorAll('[role="alert"],[class*="toast"],[class*="Toast"]');
+                for (var t = 0; t < toasts.length && t < 15; t++) scopes.push(toasts[t]);
+
+                for (var s = 0; s < scopes.length; s++) {
+                    var scope = scopes[s];
+                    if (!scope) continue;
+                    var key = scopeKey(scope);
+                    if (S.handledErr[key]) continue;
+
+                    var err = null;
+                    var leaves = scope.querySelectorAll('span,div,p');
+                    for (var j = 0; j < leaves.length; j++) {
+                        var el = leaves[j];
+                        if (el.children.length !== 0) continue;   // только листовые узлы
+                        if (el.closest('pre,code')) continue;     // текст из блока кода — не ошибка
+                        if (!matchesRl(el.textContent)) continue;
+                        if (!isVisible(el)) continue;
+                        err = el; break;
+                    }
+                    var retry = findRetryIn(scope);
+                    if (!err && !retry) continue;
+
+                    return { scope: scope, key: key, err: err, retry: retry, rate: !!err };
+                }
+                return null;
             }
 
-            function isChatEmpty() {
-                return document.querySelectorAll('[data-virtual-list-item-key]').length === 0;
+            // ---------------- поиск вызовов инструментов ----------------
+
+            var TOOL_RE = /\[TOOL:\s*(read_file|write_file|edit_file|list_files|bash|search_text)\s*\(/;
+            var RESULT_RE = /^\s*\[TOOL_(RESULT|ERROR)/;
+            var SOURCE_RE = /(^|\n)\s*(import |package |private fun |fun |val |var |public class )/;
+
+            function blockLang(pre) {
+                var root = pre.closest('.md-code-block') || pre.parentElement;
+                if (!root) return '';
+                var info = root.querySelector('.md-code-block-infostring, .md-code-block-banner');
+                return info ? (info.textContent || '').trim().toLowerCase().split(/\s+/)[0] : '';
             }
 
-            function maybePrependInstructions() {
-                if (!isChatEmpty()) return;
-                var ta = findInputTextarea();
-                if (!ta) return;
-                var val = (ta.tagName === 'TEXTAREA' ? ta.value : ta.innerText) || '';
-                if (!val.trim()) return;
-                if (val.indexOf('[SYSTEM INSTRUCTIONS]') === 0) return;
-                if (val.indexOf('[TOOL_RESULT:') === 0) return;
-                setReactValue(ta, SYSTEM_PREAMBLE + '\n\n---\n\n' + val);
-                console.log('[deepseek-agent] preamble prepended');
+            function assistantBody(item) {
+                var b = item.querySelector('.ds-assistant-message-main-content, .ds-markdown');
+                if (b) return b;
+                if (RESULT_RE.test(item.textContent || '')) return null;  // это наш результат, не ответ модели
+                return item.querySelector('pre') ? item : null;
             }
 
-            var planMode = false;
-            var PLAN_TRIGGER_RE = /^\s*(?:\/plan|план|plan)\b/i;
-            var PLAN_CONFIRM_RE = /^\s*(?:да|поехали|выполняй|ок|ok|yes|go)\b/i;
-            function detectPlanMode() {
-                var ta = findInputTextarea();
-                if (!ta) return;
-                var val = (ta.tagName === 'TEXTAREA' ? ta.value : ta.innerText) || '';
-                var t = val.trim();
-                if (!t) return;
-                if (PLAN_TRIGGER_RE.test(t)) { if (!planMode) planMode = true; return; }
-                if (planMode && PLAN_CONFIRM_RE.test(t)) { planMode = false; }
+            function extractCalls(body) {
+                if (!body) return null;
+                var pres = body.querySelectorAll('pre'), tagged = [], loose = [];
+                for (var i = 0; i < pres.length; i++) {
+                    var code = pres[i].querySelector('code') || pres[i];
+                    var t = code.textContent || '';
+                    if (!TOOL_RE.test(t) || t.length > CFG.maxBlockChars) continue;
+                    if (blockLang(pres[i]) === 'tool') tagged.push(t);
+                    else if (!SOURCE_RE.test(t)) loose.push(t);
+                }
+                if (tagged.length) return tagged.join('\n');
+                if (loose.length) return loose.join('\n');
+                if (pres.length > 0) return null;   // код есть, но это не вызовы
+                var all = body.textContent || '';
+                if (all.length > CFG.maxBlockChars || SOURCE_RE.test(all)) return null;
+                return TOOL_RE.test(all) ? all : null;
             }
 
-            function resetAutoLoopForUserTurn() {
-                autoIterations = 0;
-                autoLoopStopped = false;
-                autoLoopStopReason = '';
+            function lastAssistantWithCalls() {
+                var items = document.querySelectorAll('[data-virtual-list-item-key]');
+                for (var i = items.length - 1; i >= Math.max(0, items.length - 4); i--) {
+                    var body = assistantBody(items[i]);
+                    if (!body) continue;
+                    var text = extractCalls(body);
+                    if (!text) return null;          // последний ответ модели без вызовов — ждем
+                    return {
+                        key: (items[i].getAttribute('data-virtual-list-item-key') || 'k') + '|' + hashOf(text),
+                        text: text
+                    };
+                }
+                return null;
+            }
+
+            function baseline() {
+                // Дедуп идет по хешу текста, поэтому после перезагрузки страницы
+                // работа продолжается корректно и ничего не помечается виденным заранее.
+                var f = lastAssistantWithCalls();
+                if (f) S.snap[f.key] = { at: Date.now() };
+            }
+
+            // ---------------- главный цикл ----------------
+
+            function tick() {
+                try { poll(); } catch (e) { console.error('[ds-agent] poll error', e); }
+                setTimeout(tick, CFG.pollMs);
+            }
+
+            function poll() {
+                if (S.stopped) return;
+                if (isBusy()) return;               // отправкой управляют send/verify/cooldown
+
+                if (S.state === 'tools') {
+                    if (Date.now() - S.stateAt > CFG.toolTimeoutMs) {
+                        setState('idle', 'таймаут инструментов');
+                    }
+                    return;
+                }
+
+                if (isGenerating()) { setStatus('генерация ответа'); return; }
+
+                var found = lastAssistantWithCalls();
+                if (!found) { setState('idle', 'ожидание'); return; }
+                if (S.processed[found.key]) { setState('idle', 'ожидание'); return; }
+
+                var sn = S.snap[found.key];
+                if (!sn) { S.snap[found.key] = { at: Date.now() }; setState('stream', 'дочитываю ответ'); return; }
+                if (Date.now() - sn.at < CFG.stableMs) return;
+
+                if (found.text === S.lastCallText) {
+                    S.sameCallCount++;
+                    if (S.sameCallCount > CFG.maxSameCall) {
+                        S.stopped = true;
+                        setState('idle', 'цикл: модель повторяет вызов');
+                        return;
+                    }
+                } else {
+                    S.lastCallText = found.text;
+                    S.sameCallCount = 1;
+                }
+
+                if (S.iterations >= CFG.maxIterations) {
+                    S.stopped = true;
+                    setState('idle', 'лимит итераций');
+                    return;
+                }
+
+                S.processed[found.key] = true;
+                setState('tools', 'выполняю инструменты');
+                window.__dsSendToKotlin(JSON.stringify({
+                    action: 'tool_calls', runId: 'r' + Date.now(), key: found.key, text: found.text
+                }));
+            }
+
+            // ---------------- приём результата и отправка ----------------
+
+            window.__dsInsertToolResult = function(runId, b64) {
+                var text;
+                try { text = b64d(b64); } catch (e) { text = '[TOOL_RESULT]\ndecode error: ' + e; }
+                S.pendingText = text;
+                S.rlHits = 0;
+                setState('send', 'готовлю отправку');
+                queueSend(0);
+            };
+
+            function abortSend(msg) { setState('idle', msg + ' — __dsRetry()'); }
+
+            function queueSend(attempt) {
+                if (S.state !== 'send' || S.pendingText === null) return;
+                if (attempt > 40) { abortSend('не удалось отправить'); return; }
+
+                var f = findFailedSend();
+                if (f) { cooldown(f); return; }
+
+                if (isGenerating()) {
+                    setStatus('жду окончания генерации');
+                    setTimeout(function() { queueSend(attempt + 1); }, 800);
+                    return;
+                }
+
+                var wait = S.minInterval - (Date.now() - S.lastSendAt);
+                if (S.lastSendAt > 0 && wait > 0) {
+                    setStatus('пауза ' + Math.ceil(wait / 1000) + ' с');
+                    setTimeout(function() { queueSend(attempt); }, Math.min(wait, 1200));
+                    return;
+                }
+
+                var input = findInput();
+                if (!input) { setTimeout(function() { queueSend(attempt + 1); }, 500); return; }
+
+                setValue(input, S.pendingText);
+                S.iterations++;
+                S.lastSendAt = Date.now();
+                setStatus('отправка (' + S.iterations + '/' + CFG.maxIterations + ')');
+                setTimeout(function() { sendLoop(input, 0); }, 250);
+            }
+
+            function sendLoop(input, attempt) {
+                if (S.state !== 'send') return;
+                var f = findFailedSend();
+                if (f) { cooldown(f); return; }
+                if (readValue(input).trim() === '') {
+                    setState('verify', 'проверяю доставку');
+                    verify(Date.now());
+                    return;
+                }
+                if (attempt >= CFG.sendAttempts) { abortSend('кнопка не сработала'); return; }
+                input.focus();
+                var btn = findSendButton(input);
+                if (attempt % 2 === 0 && btn && btn.getAttribute('aria-disabled') !== 'true') btn.click();
+                else pressEnter(input);
+                setTimeout(function() { sendLoop(input, attempt + 1); }, 900);
+            }
+
+            // Пустое поле ввода еще не значит доставку: ошибка появляется с задержкой.
+            function verify(startedAt) {
+                if (S.state !== 'verify') return;
+                var f = findFailedSend();
+                if (f) { cooldown(f); return; }
+                if (isGenerating()) { sendAccepted(); return; }
+                if (Date.now() - startedAt >= CFG.verifyMs) { sendAccepted(); return; }
+                setTimeout(function() { verify(startedAt); }, 400);
+            }
+
+            function sendAccepted() {
+                S.pendingText = null;
+                if (S.minInterval > CFG.minSendInterval) {
+                    S.minInterval = Math.max(CFG.minSendInterval, S.minInterval - 1000);
+                }
+                setState('idle', 'результат отправлен');
+            }
+
+            function cooldown(f) {
+                if (S.state === 'cooldown') return;
+                S.rlHits++;
+                if (f && f.rate && S.minInterval < CFG.rlBackoffMs) S.minInterval = CFG.rlBackoffMs;
+
+                if (S.rlHits > CFG.rlMaxWaits) {
+                    if (f) S.handledErr[f.key] = true;
+                    abortSend('лимит не спадает');
+                    return;
+                }
+
+                var waitMs = (f && f.rate) ? CFG.rlWaitMs : CFG.failWaitMs;
+                var startedAt = Date.now();
+                setState('cooldown', (f && f.rate ? 'rate limit' : 'ошибка отправки') +
+                    ': пауза (' + S.rlHits + '/' + CFG.rlMaxWaits + ')');
+
+                (function waitLoop() {
+                    if (S.state !== 'cooldown') return;
+                    var left = waitMs - (Date.now() - startedAt);
+                    if (left > 0) {
+                        setStatus((f && f.rate ? 'rate limit: ' : 'повтор через ') +
+                            Math.ceil(left / 1000) + ' с (' + S.rlHits + '/' + CFG.rlMaxWaits + ')');
+                        setTimeout(waitLoop, 1000);
+                        return;
+                    }
+
+                    var cur = findFailedSend();
+                    var retry = cur && cur.retry;
+                    if (retry) {
+                        setState('verify', 'жму кнопку повтора');
+                        S.lastSendAt = Date.now();
+                        try { retry.click(); } catch (e) { console.warn('[ds-agent] retry click failed', e); }
+                        setTimeout(function() { afterRetryClick(cur, Date.now()); }, 800);
+                    } else {
+                        // Кнопки нет — помечаем ошибку отработанной, иначе она навсегда
+                        // останется в хвосте чата и будет триггерить cooldown по кругу.
+                        if (cur) S.handledErr[cur.key] = true;
+                        S.lastSendAt = Date.now() - S.minInterval;
+                        setState('send', 'повторная отправка текстом');
+                        queueSend(0);
+                    }
+                })();
+            }
+
+            function afterRetryClick(f, startedAt) {
+                if (S.state !== 'verify') return;
+                var still = findFailedSend();
+                if (!still || still.key !== f.key) { verify(Date.now()); return; }   // ошибка ушла
+                if (isGenerating()) { sendAccepted(); return; }
+                if (Date.now() - startedAt >= CFG.retryCheckMs) {
+                    S.state = 'send';            // снимаем guard и уходим на новый круг
+                    cooldown(still);
+                    return;
+                }
+                setStatus('жду результат повтора');
+                setTimeout(function() { afterRetryClick(f, startedAt); }, 500);
+            }
+
+            // ---------------- ручная отправка ----------------
+
+            function needsPreamble(input) {
+                if (document.querySelectorAll('[data-virtual-list-item-key]').length !== 0) return false;
+                var v = readValue(input);
+                return v.trim().length > 0 && v.indexOf('[SYSTEM INSTRUCTIONS]') !== 0;
+            }
+
+            function resetLoop() {
+                S.iterations = 0; S.stopped = false; S.sameCallCount = 0; S.rlHits = 0;
+                S.handledErr = {};
+                if (S.state !== 'tools' && !isBusy()) setState('idle', 'готов');
+            }
+
+            function injectPreambleAndSend(input) {
+                setValue(input, SYSTEM_PREAMBLE + '\n\n---\n\n' + readValue(input));
+                setTimeout(function() {
+                    var b = findSendButton(input);
+                    if (b) b.click(); else pressEnter(input);
+                }, 200);
             }
 
             document.addEventListener('keydown', function(e) {
-                if (e.key !== 'Enter' || e.shiftKey) return;
-                var t = e.target;
-                if (!t || (t.tagName !== 'TEXTAREA' && !t.isContentEditable)) return;
-                if (!isAutoSending) resetAutoLoopForUserTurn();
-                detectPlanMode();
-                maybePrependInstructions();
+                if (!e.isTrusted || isBusy()) return;          // игнорируем свои же события
+                if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
+                var input = findInput();
+                if (!input) return;
+                resetLoop();
+                if (!needsPreamble(input)) return;
+                e.preventDefault(); e.stopImmediatePropagation();
+                injectPreambleAndSend(input);
             }, true);
 
             document.addEventListener('click', function(e) {
-                if (!e.target || !e.target.closest) return;
-                var btn = e.target.closest('button');
-                if (!btn) return;
-                var ta = findInputTextarea();
-                if (!ta) return;
-                var form = ta.closest('form') || (ta.parentElement && ta.parentElement.parentElement);
-                if (form && form.contains(btn)) {
-                    if (!isAutoSending) resetAutoLoopForUserTurn();
-                    detectPlanMode();
-                    maybePrependInstructions();
-                }
+                if (!e.isTrusted || isBusy()) return;
+                var input = findInput();
+                if (!input) return;
+                var btn = findSendButton(input);
+                if (!btn || !(btn === e.target || btn.contains(e.target))) return;
+                resetLoop();
+                if (!needsPreamble(input)) return;
+                e.preventDefault(); e.stopImmediatePropagation();
+                injectPreambleAndSend(input);
             }, true);
 
-            window.__insertToolResult = function(resultText, retries) {
-                retries = retries || 0;
-                if (retries > 30) return;
-                if (planMode) return;
-                if (autoLoopStopped) return;
-                if (autoIterations >= MAX_AUTO_ITERATIONS) {
-                    autoLoopStopped = true;
-                    autoLoopStopReason = 'MAX_AUTO_ITERATIONS';
-                    return;
-                }
+            // ---------------- отладка из консоли ----------------
 
-                // ВАЖНО: перед вставкой ждём, чтобы модель закончила текущий ответ.
-                // Иначе разрежем стрим и потеряем нить. Проверяем: если последнее
-                // сообщение ассистента мутировало меньше 1500 мс назад — стрим идёт.
-                var items = document.querySelectorAll('[data-virtual-list-item-key]');
-                var lastKey = items.length > 0 ? (items[items.length - 1].getAttribute('data-virtual-list-item-key') || '') : '';
-                var lastMut = lastKey ? lastMutationAt.get(lastKey) : null;
-                if (typeof lastMut === 'number' && (Date.now() - lastMut) < 1500) {
-                    console.log('[deepseek-agent] model is writing, waiting before insert');
-                    setTimeout(function() { window.__insertToolResult(resultText, retries + 1); }, 1000);
-                    return;
-                }
+            window.__dsStatus = function() { return S; };
 
-                var since = Date.now() - lastAutoSendAt;
-                var wait = AUTO_MIN_INTERVAL_MS - since;
-                if (lastAutoSendAt > 0 && wait > 0) {
-                    setTimeout(function() { window.__insertToolResult(resultText, retries); }, wait);
-                    return;
-                }
-
-                var input = findInputTextarea();
-                if (!input) {
-                    setTimeout(function() { window.__insertToolResult(resultText, retries + 1); }, 500);
-                    return;
-                }
-                var cancelBtn = Array.prototype.find.call(
-                    document.querySelectorAll('button, div[role="button"]'),
-                    function(b) { return (b.innerText || '').trim() === 'Отмена'; }
-                );
-                if (cancelBtn) { cancelBtn.click(); setTimeout(function() { window.__insertToolResult(resultText, retries); }, 250); return; }
-
-                pendingResultText = resultText;
-                setReactValue(input, resultText);
-                autoIterations++;
-                lastAutoSendAt = Date.now();
-                isAutoSending = true;
-                console.log('[deepseek-agent] auto-send #' + autoIterations + '/' + MAX_AUTO_ITERATIONS + ' len=' + resultText.length);
-
-                setTimeout(function() {
-                    input.focus();
-                    ['keydown','keypress','keyup'].forEach(function(type) {
-                        input.dispatchEvent(new KeyboardEvent(type, {
-                            key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-                            bubbles: true, cancelable: true
-                        }));
-                    });
-                    setTimeout(function() {
-                        var val = input.value || input.innerText || '';
-                        if (val.length > 0) {
-                            var sendBtn = document.querySelector('button[type="submit"]');
-                            if (sendBtn) sendBtn.click();
-                        }
-                        setTimeout(function() { isAutoSending = false; }, 300);
-                        setTimeout(function() { if (!autoLoopStopped) pendingResultText = null; }, 12000);
-                    }, 200);
-                }, 200);
+            window.__dsRetry = function() {
+                S.stopped = false; S.rlHits = 0; S.handledErr = {};
+                if (S.pendingText !== null) { setState('send', 'повтор'); queueSend(0); }
+                else setState('idle', 'готов');
             };
 
-            var processedKeys = new Set();
-            var seenText = new Map();
-            var debounceTimers = new Map();
-            var lastMutationAt = new Map();
-            var lastUrl = location.href;
-            var lastMessageCount = -1;
-            var lastFirstKey = null;
-            var TOOL_RE = /\[TOOL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([\s\S]*?)\)\s*]/;
+            window.__dsProbeRetry = function() {
+                var f = findFailedSend();
+                console.log('[ds-agent] failed send:', f);
+                if (f) console.log('  retry btn:', f.retry, '| err:', f.err && f.err.textContent);
+                return f;
+            };
 
-            function baselineExisting(reason) {
-                var items = document.querySelectorAll('[data-virtual-list-item-key]');
-                var added = 0;
-                items.forEach(function(el) {
-                    var key = el.getAttribute('data-virtual-list-item-key');
-                    if (key && !processedKeys.has(key)) {
-                        processedKeys.add(key);
-                        added++;
-                    }
-                });
-                lastMessageCount = items.length;
-                console.log('[deepseek-agent] baseline (' + reason + '): ' + added + ' items');
-            }
+            window.__dsStop = function() { S.stopped = true; setState('idle', 'остановлен вручную'); };
 
-            function extractToolCallsText(contentEl) {
-                var preBlocks = contentEl.querySelectorAll('pre');
-                var chunks = [];
-                for (var i = 0; i < preBlocks.length; i++) {
-                    var t = preBlocks[i].textContent || '';
-                    if (TOOL_RE.test(t)) chunks.push(t);
-                }
-                console.log('[deepseek-agent] pre-blocks: ' + preBlocks.length + ', with TOOL: ' + chunks.length);
-                if (chunks.length === 0) return null;
-                var combined = chunks.join('\n');
-                console.log('[deepseek-agent] collected ' + chunks.length + ' pre-block(s), len=' + combined.length);
-                return combined;
-            }
-
-            function hasKnownToolCall(text) {
-                var re = /\[TOOL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g;
-                var m;
-                while ((m = re.exec(text)) !== null) {
-                    if (KNOWN_TOOLS.indexOf(m[1]) !== -1) return true;
-                }
-                return false;
-            }
-
-            function hasToolbarWithButtons(root) {
-                if (!root) return false;
-                var bars = root.querySelectorAll('div.ds-flex[style*="gap: 10px"]');
-                for (var b = 0; b < bars.length; b++) {
-                    var btns = bars[b].querySelectorAll('div[role="button"], button');
-                    if (btns.length >= 5) return true;
-                }
-                return false;
-            }
-
-            function isMessageFinalized(itemEl) {
-                if (hasToolbarWithButtons(itemEl)) return true;
-                var next = itemEl.nextElementSibling;
-                if (next && hasToolbarWithButtons(next)) return true;
-                var parent = itemEl.parentElement;
-                if (parent && hasToolbarWithButtons(parent)) return true;
-                var bar = itemEl.closest('[data-virtual-list-item-key], .ds-virtual-list-visible-items');
-                if (bar) {
-                    var labels = bar.querySelectorAll('[aria-label]');
-                    for (var i = 0; i < labels.length; i++) {
-                        var lbl = (labels[i].getAttribute('aria-label') || '').toLowerCase();
-                        if (lbl === 'читать вслух' || lbl === 'read aloud') return true;
-                    }
-                }
-                var items = document.querySelectorAll('[data-virtual-list-item-key]');
-                if (items.length > 0 && items[items.length - 1] === itemEl) {
-                    var globalLabels = document.querySelectorAll('[aria-label]');
-                    for (var g = 0; g < globalLabels.length; g++) {
-                        var gl = (globalLabels[g].getAttribute('aria-label') || '').toLowerCase();
-                        if (gl === 'читать вслух' || gl === 'read aloud') return true;
-                    }
-                }
-                var key = itemEl.getAttribute('data-virtual-list-item-key') || '';
-                if (key) {
-                    var lastMut = lastMutationAt.get(key);
-                    if (typeof lastMut === 'number' && (Date.now() - lastMut) > 2500) return true;
-                }
-                return false;
-            }
-
-            function tryProcess(itemEl) {
-                var key = itemEl.getAttribute('data-virtual-list-item-key') || '';
-                if (!key) return;
-                if (processedKeys.has(key)) return;
-                if (!isMessageFinalized(itemEl)) { scheduleCheck(itemEl); return; }
-                var contentEl = itemEl.querySelector('.ds-assistant-message-main-content');
-                if (!contentEl) return;
-                var text = extractToolCallsText(contentEl);
-                if (!text) return;
-                if (!hasKnownToolCall(text)) return;
-                if (autoLoopStopped) { processedKeys.add(key); return; }
-                var prev = seenText.get(key);
-                if (prev === text) return;
-                seenText.set(key, text);
-                console.log('[deepseek-agent] dispatching tool call key=' + key + ', len=' + text.length);
-                window.__sendToKotlin(JSON.stringify({ action: 'tool_calls', key: key, text: text }));
-                processedKeys.add(key);
-            }
-
-            function scheduleCheck(itemEl) {
-                var key = itemEl.getAttribute('data-virtual-list-item-key') || '';
-                if (!key) return;
-                lastMutationAt.set(key, Date.now());
-                var prev = debounceTimers.get(key);
-                if (prev) clearTimeout(prev);
-                var t = setTimeout(function() {
-                    debounceTimers.delete(key);
-                    tryProcess(itemEl);
-                }, 2000);
-                debounceTimers.set(key, t);
-            }
-
-            function scanAll() {
-                document.querySelectorAll('[data-virtual-list-item-key]')
-                    .forEach(function(el) { scheduleCheck(el); });
-            }
-
-            var observer = new MutationObserver(function(mutations) {
-                mutations.forEach(function(m) {
-                    m.addedNodes.forEach(function(n) {
-                        if (!(n instanceof HTMLElement)) return;
-                        if (n.matches && n.matches('[data-virtual-list-item-key]')) {
-                            scheduleCheck(n);
-                        } else if (n.querySelectorAll) {
-                            n.querySelectorAll('[data-virtual-list-item-key]').forEach(scheduleCheck);
-                            var p = n.closest && n.closest('[data-virtual-list-item-key]');
-                            if (p) scheduleCheck(p);
-                        }
-                    });
-                    if (m.type === 'characterData' && m.target && m.target.parentElement) {
-                        var p = m.target.parentElement.closest('[data-virtual-list-item-key]');
-                        if (p) scheduleCheck(p);
-                    }
-                });
-            });
-
-            function attachObserver() {
-                try {
-                    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-                    console.log('[deepseek-agent] observer attached to document.body');
-                } catch (e) { console.error('[deepseek-agent] observe failed', e); }
-                baselineExisting('attach');
-                scanAll();
-            }
-
-            function detectRateLimit() {
-                var items = document.querySelectorAll('[data-virtual-list-item-key]');
-                var lastN = Math.min(items.length, 3);
-                for (var k = items.length - lastN; k < items.length; k++) {
-                    var it = items[k]; if (!it) continue;
-                    var txt = it.innerText || '';
-                    for (var m = 0; m < RATE_LIMIT_PATTERNS.length; m++) {
-                        if (txt.indexOf(RATE_LIMIT_PATTERNS[m]) !== -1) return RATE_LIMIT_PATTERNS[m];
-                    }
-                }
-                return null;
-            }
-
-            function watchdog() {
-                try {
-                    var urlChanged = (location.href !== lastUrl);
-                    var items = document.querySelectorAll('[data-virtual-list-item-key]');
-                    var currentCount = items.length;
-                    var firstKey = items.length > 0 ? (items[0].getAttribute('data-virtual-list-item-key') || '') : '';
-                    var chatChanged = (lastFirstKey !== null) && (firstKey !== lastFirstKey) && (firstKey !== '');
-                    lastFirstKey = firstKey;
-                    var reset = (currentCount < lastMessageCount);
-                    if (urlChanged || reset || chatChanged) {
-                        if (urlChanged) lastUrl = location.href;
-                        setTimeout(function() { baselineExisting(urlChanged ? 'url-change' : 'reset'); }, 800);
-                        setTimeout(scanAll, 1200);
-                    }
-                    if (!autoLoopStopped) {
-                        var rl = detectRateLimit();
-                        if (rl) {
-                            autoLoopStopped = true;
-                            autoLoopStopReason = 'rate limit: ' + rl;
-                            setTimeout(function() {
-                                autoLoopStopped = false;
-                                autoLoopStopReason = '';
-                                autoIterations = 0;
-                                if (pendingResultText) {
-                                    var retry = pendingResultText;
-                                    pendingResultText = null;
-                                    setTimeout(function() { window.__insertToolResult(retry); }, 1000);
-                                }
-                            }, AUTO_COOLDOWN_AFTER_RATELIMIT_MS);
-                        }
-                    }
-                } catch (e) {}
-                setTimeout(watchdog, 2000);
-            }
-
-            window.__deepseekAgentEnsure = function() { baselineExisting('ensure'); scanAll(); };
-
-            if (document.readyState === 'complete' || document.readyState === 'interactive') {
-                attachObserver(); watchdog();
-            } else {
-                window.addEventListener('DOMContentLoaded', function() { attachObserver(); watchdog(); });
-            }
+            baseline();
+            setState('idle', 'готов');
+            tick();
+            console.log('[ds-agent] v4 injected');
         })();
         """.trimIndent()
     }
@@ -700,76 +753,31 @@ class MyToolWindowFactory : ToolWindowFactory {
     private class DisposeFlag { @Volatile var value: Boolean = false }
 
     companion object {
+        private const val MAX_RESULT_CHARS = 60_000
+        private const val BATCH_TIMEOUT_SEC = 120L
+
         private val SYSTEM_PREAMBLE = """
             [SYSTEM INSTRUCTIONS]
-            Ты — агент, работающий внутри IDE. У тебя ЕСТЬ доступ к файловой системе проекта через инструменты.
+            Ты — автономный ИИ-ассистент, встроенный в IDE. У тебя есть прямой доступ к проекту.
 
             Доступные инструменты:
-            - read_file("path"[, "startLine-endLine"]) — читает файл. Для больших файлов указывай диапазон строк, например read_file("big.ts", "120-180").
-            - edit_file("path", "old_string", "new_string") — точечная замена. Находит old_string и заменяет на new_string. 4-й необязательный аргумент "all" — заменить все вхождения.
-            - write_file("path", "content"[, "append"]) — запись файла. Без 3-го аргумента перезаписывает, с "append" — дописывает в конец. ВАЖНО: при append плагин САМ вставляет \n между старым и новым содержимым, если файл не заканчивался на \n. Тебе не нужно добавлять \n в начало content. Большие НОВЫЕ файлы пиши по частям: первый вызов write_file(path, chunk1), затем write_file(path, chunk2, "append"), и так далее.
-            - list_files("path") — показывает содержимое директории.
-            - bash("command") — выполняет shell-команду в корне проекта.
-            - search_text("needle") — ищет текст по всем файлам проекта.
+            - read_file("path"[, "startLine-endLine"]) — чтение файла
+            - edit_file("path", "old_string", "new_string"[, "all"]) — точечная замена
+            - write_file("path", "content"[, "append"]) — создание/перезапись файла
+            - list_files("path") — список файлов
+            - bash("command") — терминал
+            - search_text("needle") — поиск по коду
 
-            ПАРАЛЛЕЛЬНОСТЬ:
-            - Несколько bash в одном ходу запускаются ПАРАЛЛЕЛЬНО.
-            - Все файловые операции (read_file, write_file, edit_file, list_files, search_text) выполняются ПОСЛЕДОВАТЕЛЬНО в порядке вызова.
-            - Результаты bash приходят по одному, по мере завершения.
-            - Результаты всех файловых операций приходят одним пакетом, после того как отработали все.
-            - НЕ ПОВТОРЯЙ вызов, если результата ещё нет. Дождись.
-
-            !!! ФОРМАТ ВЫЗОВА: ОБОРАЧИВАЙ В ```tool ... ``` !!!
-            
-            ВАЖНО: любой вызов — только внутри ```tool```-блока. Вызовы в обычном тексте (без блока) ИГНОРИРУЮТСЯ и не выполняются.
-
-            Web-интерфейс DeepSeek рендерит Markdown прямо в сообщении: #, *, _, backticks удаляются из видимого текста до того, как инструмент его получит. Поэтому ВСЕГДА оборачивай ВСЕ вызовы в блок кода с языком "tool":
-
+            КРИТИЧЕСКИ ВАЖНО:
+            Любой вызов делай ТОЛЬКО внутри блока кода с языком tool:
             ```tool
-            [TOOL: write_file("README.md", "## Заголовок\n\nТекст с \`inline code\` и блоком:\n\`\`\`bash\nnpm run dev\n\`\`\`\n")]
+            [TOOL: list_files(".")]
             ```
-            
-            Внутри этого блока ты пишешь вызов как обычно: один или несколько вызовов, каждый на своей строке. Не бойся многострочных аргументов — внутри tool ... вся разметка сохраняется дословно.
-
-            МОЖНО ВЫЗЫВАТЬ НЕСКОЛЬКО ИНСТРУМЕНТОВ ЗА ОДИН ХОД. Если действия независимы (создать 3 файла, прочитать 3 разных файла) — пиши их подряд в одном ```tool блоке. Результаты придут вместе, одним сообщением с несколькими [TOOL_RESULT: имя].
-
-            КАК ВЫЗЫВАТЬ (формат внутри ```tool):
-                [TOOL: имя_инструмента("аргумент1", "аргумент2")]
-                Аргументы в двойных кавычках, разделитель — запятая. Внутри строк можно использовать \n, \t, ", .
-                После закрывающих ``` не пиши больше вызовов — просто заверши ход коротким текстом.
-
-            РЕЖИМ ПЛАНА (PLAN MODE):
-                Если пользователь написал в начале сообщения слово «план» или «plan» (например: «план: отрефактори модуль авторизации») — ты НЕ вызываешь инструменты. Вместо этого составляешь подробный пошаговый план:
-                1. Что именно будешь делать на каждом шаге.
-                2. Какие файлы затронешь.
-                3. Какие инструменты будешь вызывать (только описательно, не в формате [TOOL: ...]).
-                4. Что может пойти не так и как ты это учтёшь.
-                Затем заканчиваешь ход фразой: «Готов выполнять? Ответь да или поехали.»
-                Никаких [TOOL: ...] в plan-режиме. Только план текстом.
-                Когда пользователь ответит «да» / «поехали» / «выполняй» — тогда начинаешь выполнять шаг за шагом обычным способом.
-
-            ДИСЦИПЛИНА АВТОНОМНОГО РЕЖИМА:
-                - НЕ исследуй проект «на всякий случай». Только то, что нужно для выполнения текущего запроса пользователя.
-                - Если задача уже выполнена — остановись и напиши короткий итог.
-                - Не больше 5-7 ходов на один запрос пользователя, если он не попросил обойти весь проект.
-                - Если не уверен, нужен ли следующий вызов — НЕ вызывай, а спроси пользователя или заверши ход.
-                - Не вызывай bash ради «посмотреть». Если файл можно прочитать через read_file — читай через read_file, а не cat. Если нужен список файлов — list_files, а не ls. Если нужен поиск — search_text, а не grep.
-                - Если запускаешь bash с ожиданием (sleep, длинные команды) — запусти его ПАРАЛЛЕЛЬНО с другими вызовами, а не отдельно. Один bash в ходу — норма; один bash с ожиданием без других задач — потеря времени (только если это не отдельное / обязательное действие).
-
-            ПЛЕЙСХОЛДЕРЫ — НЕ ПИШИ:
-                - НИКОГДА не пиши примеры вроде [TOOL: name(...)] или [TOOL: имя_инструмента(...)] — они будут восприняты как реальный вызов. Даже в ```tool блоке. Если нужно объяснить синтаксис — пиши словами. В крайнем случае можно обернуть пример в одинарные бэккеты (`[TOOL: bash()]`), но НЕ РЕКОМЕНДУЕТСЯ. НИКОГДА не подставляй в аргументы пути-заглушки: три точки, две точки, одну точку, path, path/to/file, <path>, your_file, filename — это тоже плейсхолдер. Если конкретный путь неизвестен — сначала вызови list_files(".") или search_text с осмысленным запросом, чтобы узнать реальный путь.
-
-            КАК РЕДАКТИРОВАТЬ ФАЙЛЫ:
-                - Для ИЗМЕНЕНИЯ существующего файла ВСЕГДА используй edit_file, а НЕ write_file.
-                - Сначала read_file — прочитай нужный фрагмент.
-                - Потом edit_file с МИНИМАЛЬНЫМ уникальным old_string (несколько строк контекста) и его новой версией new_string.
-                - write_file применяй ТОЛЬКО для НОВЫХ файлов или когда действительно нужно перезаписать весь файл целиком (и он небольшой).
-                - НИКОГДА не помещай в ответ содержимое больших файлов (мегабайты данных), base64-блобы, минифицированные бандлы. Если файл большой — работай через edit_file по частям.
-            
-            ВАЖНО:
-                - НИКОГДА не говори, что у тебя нет доступа к файлам, директориям или терминалу. Просто вызывай инструмент.
-                - Прежде чем писать код — читай релевантные файлы через read_file / search_text.
+            Если написать вызов без блока ```tool, веб-интерфейс сотрет все символы Markdown (#, *, |, backticks) из аргументов до их выполнения.
+            Все аргументы — в двойных кавычках, скобки и кавычки внутри строк экранируй через \.
+            Результаты всех вызванных инструментов придут в следующем сообщении одним общим блоком.
+            Записывать и изменять файлы можно только внутри корня проекта.
             [/SYSTEM INSTRUCTIONS]
-    """.trimIndent()
+        """.trimIndent()
     }
 }

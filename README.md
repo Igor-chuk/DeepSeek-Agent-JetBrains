@@ -1,42 +1,51 @@
 # DeepSeek Agent
 
-An IntelliJ IDEA plugin that embeds [chat.deepseek.com](https://chat.deepseek.com) into a tool window and gives the web model **real access to your project**: reading files, editing them in place, searching, running shell commands — and feeding the results back into the chat.
+An IntelliJ IDEA plugin that embeds [chat.deepseek.com](https://chat.deepseek.com) into a tool window and gives the model real access to the project: reading, editing, searching, running shell commands.
 
-The model stays where it is. The IDE does the work.
+## Tools
 
----
+| Tool | Signature | Notes |
+| --- | --- | --- |
+| `read_file` | `read_file("path"[, "startLine-endLine"])` | Files over 10 MB refused; output over 20 000 chars truncated, range form suggested. |
+| `edit_file` | `edit_file("path", "old", "new"[, "all"])` | In-place replacement; refuses empty/ambiguous/missing old string; normalizes CRLF. |
+| `write_file` | `write_file("path", "content"[, "append"])` | Full rewrite up to 5 MB, or append (auto `\n`). Refuses paths outside the project. |
+| `list_files` | `list_files("path")` | Capped at 400 entries. |
+| `search_text` | `search_text("needle")` | Max 100 hits / 5 s. Skips `.git`, `node_modules`, `build`, `.next`, `.gradle`, `.idea`, `.intellijPlatform`, `.kotlin`, `.run`, `.ai`, `out`, `target`, `dist`, binary files. |
+| `bash` | `bash("command")` | Project root; output capped at 40 000 chars; timeout 90 s. |
 
-## Features
+Batch calls: up to 20 tools per turn.
 
-### Tools the model can call
+## Batch results
 
-| Tool | Signature | What it does |
-|------|-----------|--------------|
-| `read_file` | `read_file("path"[, "startLine-endLine"])` | Reads a file. For files over 20 000 chars, returns the beginning plus a hint to use the range form. |
-| `edit_file` | `edit_file("path", "old", "new"[, "all"])` | Targeted in-place replacement. Refuses on empty / ambiguous / missing `old` string. |
-| `write_file` | `write_file("path", "content"[, "append"])` | Write a file. Without 3rd arg — full rewrite (up to 5 MB). With `"append"` — appends to the end, auto-inserting `\n` if the file didn't end with one. |
-| `list_files` | `list_files("path")` | Lists a directory. |
-| `search_text` | `search_text("needle")` | Grep-like search across the project. Skips `.git`, `node_modules`, `build`, `.next`. |
-| `bash` | `bash("command")` | Runs a shell command in the project root. |
+All calls from one assistant turn run together and come back as a single `[TOOL_RESULT: ...]` message (capped at 60 000 chars). `bash` calls run in parallel; file operations run sequentially; output is in call order.
 
-Batch calls are supported — several tools per assistant turn.
+## System preamble
 
-### Asynchronous tool results
+On the first message of each chat the plugin prepends a prompt that lists the tools, explains the `tool` code-fence syntax, prefers `edit_file` over `write_file`, and forbids placeholder paths.
 
-Each result is delivered to the chat **as soon as the corresponding tool finishes** — not as one batch at the end. A fast `read_file` returns immediately while a slow `npm install` keeps running in the background; the model sees the fast result first and can start reasoning about it before the slow one arrives.
+## Safety
 
-Results arrive in **completion order**, not call order. Between two consecutive results there is a 1.5 s gap so that DeepSeek accepts each message separately.
+- Refused `bash` patterns: `rm -rf /`, `rm -rf ~`, `rm -rf $HOME`, `mkfs`, `dd ... of=/dev/...`, `> /dev/sd*`, fork bombs, `shutdown` / `reboot` / `poweroff`.
+- `write_file` refuses content over 5 MB and paths outside the project root; `edit_file` also refuses outside paths.
+- Placeholder-like paths (`...`, `path`, `<path>`, `your_file`, ...) are rejected by `read_file`, `write_file`, `edit_file`, `list_files`.
 
-### Plan mode
+## Auto-loop
 
-Prefix the first message with `plan:` (or `/plan`, or `план:`) and the model will produce a step-by-step plan instead of executing tools. It waits for a confirmation word (`да`, `поехали`, `выполняй`, `ok`, `yes`, `go`) before acting.
+The injected script polls the DOM (700 ms) and treats a message as final after 1200 ms of no changes. When it finds a `[TOOL: ...]` call in a `tool`-tagged block, it dispatches it to Kotlin, then inserts the result back.
 
-### System preamble
+Delivery is a small state machine (`idle | stream | tools | send | verify | cooldown`). After sending, the script waits up to `verifyMs = 3500` ms for the input to clear; on failure it enters `cooldown` and either clicks the chat's retry button or re-sends the text. Safeguards:
 
-On the first message of every new chat, the plugin automatically prepends a system prompt that tells the model:
+- `minSendInterval = 2500` ms, raised to `rlBackoffMs = 7000` after a rate limit and decayed by 1000 ms on each success,
+- `maxIterations = 60`, `maxSameCall = 3`,
+- rate limit → pause `rlWaitMs = 20000` ms; non-limit send error → pause `failWaitMs = 3000` ms,
+- `rlMaxWaits = 8` — after that the loop aborts with “лимит не спадает”,
+- `toolTimeoutMs = 180000` — unlock if Kotlin never answered,
+- `window.__dsRetry()` to resume manually.
 
-- which tools exist,
-- how to call them (fenced in ` ```tool ... ``` ` so Markdown survives the web UI),
-- how to edit files (prefer `edit_file` over `write_file`),
-- how to behave in plan mode,
-- and forbids placeholders like `[TOOL: name(...
+## Architecture
+
+- JCEF browser hosted by `MyToolWindowFactory`; `ToolRunner` executes calls.
+- `JBCefJSQuery` bridge: `window.__dsSendToKotlin` → Kotlin handler → `runToolBatch`.
+- Injected script `window.__dsAgentV4` polls (`tick` / `poll`) and extracts `[TOOL: ...]` from `tool`-tagged `<pre>` blocks.
+- Results are Base64-encoded, returned via `window.__dsInsertToolResult`.
+- Relative paths resolve against the current project.

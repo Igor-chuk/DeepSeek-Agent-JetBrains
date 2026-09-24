@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.4] — 2026-09-24
+
+### Added
+- Delivery state machine in the injected script: `idle | stream | tools | send | verify | cooldown`. After each send the script waits `verifyMs` (3500 ms) for the input to clear and, on failure, enters a cooldown instead of silently losing the message.
+- Automatic recovery from send errors: the script looks for the chat's retry button (`findFailedSend`) and clicks it, or re-sends the text as a fallback. Failed items are remembered in `handledErr` so the same error does not loop forever.
+- Adaptive send interval: `minInterval` starts at `minSendInterval` (2500 ms), jumps to `rlBackoffMs` (7000 ms) after a rate limit, and decays by 1000 ms on each successful send.
+- Separate cooldown durations: `rlWaitMs` (20000 ms) for rate limits and `failWaitMs` (3000 ms) for non-limit send errors. `rlMaxWaits` is now 8.
+- `window.__dsRetry()` for manual recovery from the console.
+
+### Changed
+- Tool results are batched again. All [TOOL: ...] calls from one assistant turn are executed together, and their results are sent back as a single message. bash commands still run in parallel with each other; file operations run sequentially.
+- The 1.5 s inter-message delay and completion-order delivery introduced in 1.2.0 are gone along with the streaming sender.
+- Injected script renamed `__dsAgentV3` → `__dsAgentV4`.
+- README brought fully in line with the current code: tool limits, safety notes, `__dsSendToKotlin` / `__dsAgentV4` architecture, and the new auto-loop parameters.
+
+### Fixed
+- README.md had been truncated mid-sentence at the end of the System preamble section. The file is now complete and consistent with the current code.
+- README.md no longer advertises features that are not in the codebase: the “Asynchronous tool results” and “Plan mode” sections were removed, and the tool table, safety notes and auto-loop parameters were brought in line with ToolRunner.kt and MyToolWindowFactory.kt.
+- search_text skip-list in the README now also lists .gradle.
+
+### Removed
+- “Asynchronous tool results” and “Plan mode” sections from the README.
+
 ## [1.2.3] — 2026-09-24
 
 ### Added

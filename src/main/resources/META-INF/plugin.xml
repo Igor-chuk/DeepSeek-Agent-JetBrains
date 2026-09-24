@@ -15,9 +15,9 @@
 
         <h3>Tools the model can call</h3>
         <ul>
-          <li><code>read_file("path")</code> — read a file</li>
+          <li><code>read_file("path"[, "startLine-endLine"])</code> — read a file or a line range</li>
           <li><code>edit_file("path", "old", "new"[, "all"])</code> — targeted in-place replacement</li>
-          <li><code>write_file("path", "content")</code> — full rewrite (capped at 500 KB)</li>
+          <li><code>write_file("path", "content"[, "append"])</code> — full rewrite or append (capped at 5 MB)</li>
           <li><code>list_files("path")</code> — list a directory</li>
           <li><code>search_text("needle")</code> — grep across the project</li>
           <li><code>bash("command")</code> — run a shell command in the project root</li>
@@ -26,7 +26,6 @@
         <h3>Key features</h3>
         <ul>
           <li>Batch tool calls — multiple tools per turn, all results in one block</li>
-          <li>Plan mode: prefix with <code>plan:</code> to get a plan before execution</li>
           <li>Auto-throttling, iteration cap, and automatic recovery from rate limits</li>
           <li>Placeholder filtering on both JS and Kotlin sides</li>
           <li>System preamble injected into the first message of every new chat</li>
@@ -41,6 +40,40 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>1.2.4</h3>
+        <ul>
+          <li>Delivery state machine (idle/stream/tools/send/verify/cooldown) with a post-send verify window</li>
+          <li>Automatic recovery from send errors: clicks the chat's retry button or re-sends the text</li>
+          <li>Adaptive send interval: 2500 ms base, 7000 ms backoff after a rate limit, decayed on success</li>
+          <li>Separate cooldowns: 20 s for rate limits, 3 s for other send errors; rlMaxWaits = 8</li>
+          <li>Tool results batched again: all calls from one turn are executed together and returned as a single [TOOL_RESULT] message</li>
+          <li>Injected script renamed __dsAgentV3 -> __dsAgentV4</li>
+          <li>README brought in line with ToolRunner.kt and MyToolWindowFactory.kt</li>
+        </ul>
+
+        <h3>1.2.3</h3>
+        <ul>
+          <li>read_file(path, "startLine-endLine") — read a specific line range; large files show the beginning plus a hint</li>
+          <li>write_file(path, content, "append") — append, auto-inserting a newline if the file didn't end with one</li>
+          <li>MAX_WRITE_CHARS raised from 500 KB to 5 MB</li>
+        </ul>
+
+        <h3>1.2.1</h3>
+        <ul>
+          <li>isMessageFinalized now scans all message-level toolbars, not just the first match</li>
+          <li>Toolbar threshold raised from 3 to 5 buttons to avoid confusing code-block toolbars</li>
+        </ul>
+
+        <h3>1.2.0</h3>
+        <ul>
+          <li>Streaming tool results delivered in completion order with a 1.5 s inter-message delay</li>
+        </ul>
+
+        <h3>1.1.9</h3>
+        <ul>
+          <li>Version bump to refresh plugin metadata</li>
+        </ul>
+
         <h3>1.1.2</h3>
         <ul>
           <li>Automatic retry of lost [TOOL_RESULT] after a rate limit</li>
